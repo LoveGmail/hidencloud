@@ -99,7 +99,9 @@ class HidenCloudBot {
         this.services = [];
         this.logMsg = [];
         this.csrfToken = '';
-        this.serviceResults = []; // 用于记录每个服务的精确续期结果
+        // [FIX] Track real renewal outcome per service
+        // Each entry: { serviceId, success, daysLeft (on restriction), renewedDays (on success), error }
+        this.renewResults = [];
     }
 
     log(msg) {
@@ -139,7 +141,7 @@ class HidenCloudBot {
                 return {
                     status: res.status,
                     url: res.url, // Final URL after redirects
-                    headers: {}, 
+                    headers: {}, // We can't iterate headers easily in all browsers, but usually not needed for logic if we trust auto-redirects
                     data: text
                 };
             }, { url: targetUrl, method, data: data ? data.toString() : null, headers });
@@ -202,8 +204,6 @@ class HidenCloudBot {
     async processService(service) {
         await sleep(2000, 4000);
         this.log(`>>> 处理服务 ID: ${service.id}`);
-        
-        let statusStr = "未知状态";
 
         try {
             const manageRes = await this.request('GET', `/service/${service.id}/manage`);
@@ -218,35 +218,66 @@ class HidenCloudBot {
             params.append('days', RENEW_DAYS);
 
             const res = await this.request('POST', `/service/${service.id}/renew`, params.toString());
-            
-            // 将HTML标签剥离以便准确正则匹配剩余天数
-            const textContent = res.data.replace(/<[^>]+>/g, ' '); 
-            const daysMatch = textContent.match(/expires in\s+(\d+)\s+days/i);
 
-            // 核心修复：检查响应文本是否包含尚未到期的拒绝提示
-            if (res.data.includes('Renewal Restricted')) {
-                let days = daysMatch ? daysMatch[1] : 'x';
-                this.log(`⚠️ 续期失败，还没到到期前一天。您的服务器还有 ${days} 天到期。`);
-                statusStr = `续期失败,Renewal Restricted\nYou can only renew your free service when there is less than 1 day left before it expires. Your service expires in ${days} days.`;
-            } else if (res.finalUrl && res.finalUrl.includes('/invoice/')) {
+            // [FIX] Check for "Renewal Restricted" BEFORE checking the redirect URL.
+            // HidenCloud returns this error (in JSON or HTML body) with HTTP 200,
+            // so the script previously fell through to checkAndPayInvoices and
+            // falsely reported success.
+            const bodyText = res.data || '';
+
+            if (bodyText.includes('Renewal Restricted')) {
+                // Extract how many days are left, e.g. "Your service expires in 3 days."
+                const daysMatch = bodyText.match(/expires in (\d+) days?/i);
+                const daysLeft = daysMatch ? parseInt(daysMatch[1], 10) : null;
+                const daysMsg = daysLeft !== null
+                    ? `Your service expires in ${daysLeft} days.`
+                    : 'Check the dashboard for the exact expiry date.';
+
+                this.log(`❌ 续期受限 (服务 ${service.id}): Renewal Restricted. ${daysMsg}`);
+                this.renewResults.push({
+                    serviceId: service.id,
+                    success: false,
+                    restricted: true,
+                    daysLeft,
+                    message: `Renewal Restricted\nYou can only renew your free service when there is less than 1 day left before it expires. ${daysMsg}`
+                });
+                return;
+            }
+
+            if (res.finalUrl && res.finalUrl.includes('/invoice/')) {
                 this.log(`⚡️ 续期成功，前往支付`);
                 await this.performPayFromHtml(res.data, res.finalUrl);
-                statusStr = `✅ 成功，Your service expires in ${RENEW_DAYS} days.`;
+                this.renewResults.push({
+                    serviceId: service.id,
+                    success: true,
+                    renewedDays: RENEW_DAYS,
+                    message: `Your service expires in ${RENEW_DAYS} days.`
+                });
             } else {
                 this.log('⚠️ 续期后未跳转，检查账单列表...');
-                await this.checkAndPayInvoices(service.id);
-                // 默认没有提示限制且处理完账单即为成功
-                statusStr = `✅ 成功，Your service expires in ${RENEW_DAYS} days.`;
+                const paid = await this.checkAndPayInvoices(service.id);
+                this.renewResults.push({
+                    serviceId: service.id,
+                    success: paid,
+                    renewedDays: paid ? RENEW_DAYS : null,
+                    message: paid
+                        ? `Your service expires in ${RENEW_DAYS} days.`
+                        : '续期后未找到应付账单，请手动确认。'
+                });
             }
 
         } catch (e) {
             this.log(`❌ 处理异常: ${e.message}`);
-            statusStr = `处理异常: ${e.message}`;
+            this.renewResults.push({
+                serviceId: service.id,
+                success: false,
+                restricted: false,
+                message: `处理异常: ${e.message}`
+            });
         }
-        
-        this.serviceResults.push({ id: service.id, statusStr });
     }
 
+    // [FIX] Returns true if an invoice was found and paid, false otherwise
     async checkAndPayInvoices(serviceId) {
         await sleep(2000, 3000);
         try {
@@ -261,16 +292,18 @@ class HidenCloudBot {
 
             const uniqueInvoices = [...new Set(invoiceLinks)];
             if (uniqueInvoices.length === 0) {
-                this.log(`✅ 无未支付账单`);
-                return;
+                this.log(`ℹ️ 无未支付账单（续期可能未生效）`);
+                return false;
             }
 
             for (const url of uniqueInvoices) {
                 await this.paySingleInvoice(url);
                 await sleep(3000, 5000);
             }
+            return true;
         } catch (e) {
             this.log(`❌ 查账单出错: ${e.message}`);
+            return false;
         }
     }
 
@@ -385,6 +418,7 @@ async function launchChrome() {
     }
 }
 
+
 async function attemptTurnstileCdp(page) {
     const frames = page.frames();
     for (const frame of frames) {
@@ -480,7 +514,6 @@ async function sendTelegramNotification(summaryText) {
         const user = users[i];
         console.log(`\n=== 正在处理用户 ${i + 1}: ${user.username} ===`);
 
-        // 1. Prepare Isolated Environment
         let browser;
         let chromeProcess;
         let page;
@@ -514,7 +547,6 @@ async function sendTelegramNotification(summaryText) {
             });
             chromeProcess.unref();
 
-            // Wait for Port
             console.log('正在等待 Chrome...');
             let portReady = false;
             for (let k = 0; k < 20; k++) {
@@ -526,7 +558,6 @@ async function sendTelegramNotification(summaryText) {
             }
             if (!portReady) throw new Error('Chrome 启动超时');
 
-            // Connect
             console.log(`正在连接到 Chrome...`);
             browser = await chromium.connectOverCDP(`http://localhost:${DEBUG_PORT}`);
             const defaultContext = browser.contexts()[0];
@@ -574,37 +605,42 @@ async function sendTelegramNotification(summaryText) {
                 console.log('\n--- 第二阶段: 续期操作 (浏览器模式) ---');
                 if (page.isClosed()) {
                     console.error('错误: 页面意外关闭。');
-                    summary.push({ user: user.username, status: 'Failed (Page Closed)', services: 0 });
                 } else {
                     const bot = new HidenCloudBot(page, user.username);
                     if (await bot.init()) {
                         for (const svc of bot.services) {
                             await bot.processService(svc);
                         }
-                        // 收集带有具体服务器返回状态的结果集
-                        summary.push({ 
-                            user: user.username, 
-                            overall: 'Processed', 
-                            results: bot.serviceResults, 
-                            services: bot.services.length 
+
+                        // [FIX] Determine overall status from actual renewal results
+                        const anySuccess = bot.renewResults.some(r => r.success);
+                        const allRestricted = bot.renewResults.length > 0 &&
+                            bot.renewResults.every(r => r.restricted === true);
+                        const overallStatus = anySuccess ? 'Success'
+                            : allRestricted ? 'Restricted'
+                            : 'Failed';
+
+                        summary.push({
+                            user: user.username,
+                            status: overallStatus,
+                            services: bot.services.length,
+                            renewResults: bot.renewResults
                         });
                     } else {
-                        summary.push({ user: user.username, status: 'Failed (API Init)', services: 0 });
+                        summary.push({ user: user.username, status: 'Failed (API Init)', services: 0, renewResults: [] });
                     }
                 }
             } else {
-                summary.push({ user: user.username, status: 'Failed (Login)', services: 0 });
+                summary.push({ user: user.username, status: 'Failed (Login)', services: 0, renewResults: [] });
             }
 
         } catch (err) {
             console.error(`处理用户 ${user.username} 时出错: ${err.message}`);
             if (page) await page.screenshot({ path: `error_process_${i}.png` }).catch(() => { });
         } finally {
-            // Cleanup Everything for this user
             console.log('正在清理用户环境...');
             try { if (browser) await browser.close(); } catch (e) { }
 
-            // Kill the chrome process we started
             try {
                 if (process.platform === 'win32') {
                     require('child_process').execSync(`taskkill /F /IM chrome.exe /FI "WINDOWTITLE eq Chrome (Isolated*)" || taskkill /F /IM chrome.exe`);
@@ -619,32 +655,53 @@ async function sendTelegramNotification(summaryText) {
     }
 
     console.log('\n\n╔════════════════════════════════════════════╗');
-    console.log('║                Final Summary               ║');
+    console.log('║               Final Summary                ║');
     console.log('╚════════════════════════════════════════════╝');
-    let summaryText = `*HidenCloud 续期任务报告 (${new Date().toLocaleDateString()})*\n\n`;
+
+    // [FIX] Build Telegram message with per-service real status
+    const dateStr = new Date().toLocaleDateString('en-US', { month: 'numeric', day: 'numeric', year: 'numeric' });
+    let summaryText = `*HidenCloud 续期任务报告 (${dateStr})*\n\n`;
 
     summary.forEach(s => {
-        summaryText += `👤 用户: [${s.user}](mailto:${s.user})\n`;
+        const consoleLine = `User: ${s.user} | Status: ${s.status} | Services: ${s.services}`;
+        console.log(consoleLine);
+
+        summaryText += `👤 用户: \`${s.user}\`\n`;
         summaryText += `服务数: ${s.services}\n`;
-        
-        if (s.overall === 'Processed' && s.results && s.results.length > 0) {
-            s.results.forEach(res => {
-                summaryText += `状态: ${res.statusStr}\n`;
-                console.log(`User: ${s.user} | Service ID: ${res.id} | Status: ${res.statusStr.replace(/\n/g, ' ')}`);
-            });
+
+        if (!s.renewResults || s.renewResults.length === 0) {
+            // Login / init failure — no service-level detail
+            const isFail = s.status.includes('Failed');
+            summaryText += `状态: ${isFail ? '❌ 失败' : '⚠️ 未知'} (${s.status})\n`;
         } else {
-            summaryText += `状态: ❌ 失败 (${s.status})\n`;
-            console.log(`User: ${s.user} | Status: Failed (${s.status})`);
+            // Show per-service result
+            s.renewResults.forEach(r => {
+                summaryText += `\n  📌 服务 ID: ${r.serviceId}\n`;
+                if (r.success) {
+                    summaryText += `  状态: ✅ 续期成功\n`;
+                    summaryText += `  ${r.message}\n`;
+                } else if (r.restricted) {
+                    summaryText += `  状态: ❌ 续期失败\n`;
+                    summaryText += `  Renewal Restricted\n`;
+                    summaryText += `  You can only renew your free service when there is less than 1 day left before it expires. `;
+                    summaryText += r.daysLeft !== null
+                        ? `Your service expires in ${r.daysLeft} days.\n`
+                        : `Check the dashboard for the exact expiry date.\n`;
+                } else {
+                    summaryText += `  状态: ❌ 续期失败\n`;
+                    summaryText += `  ${r.message || '未知错误'}\n`;
+                }
+            });
         }
-        summaryText += `\n`;
+
+        summaryText += '\n';
     });
 
     await sendTelegramNotification(summaryText);
 
-    // Exit code based on success
-    if (summary.some(s => s.status && s.status.includes('Failed'))) {
-        process.exit(1);
-    } else {
-        process.exit(0);
-    }
+    // Exit code: only truly failed (not restricted) counts as failure
+    const hasRealFailure = summary.some(s =>
+        s.status.includes('Failed') || s.status === 'Failed'
+    );
+    process.exit(hasRealFailure ? 1 : 0);
 })();
