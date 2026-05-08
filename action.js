@@ -210,45 +210,7 @@ class HidenCloudBot {
             const $ = cheerio.load(manageRes.data);
             const formToken = $('input[name="_token"]').val();
 
-            // ── [FIX] Check expiry date BEFORE sending POST ──────────────────
-            // The renewal window check is client-side only on HidenCloud:
-            // the server will happily renew even when the window hasn't opened.
-            // We replicate the same check the browser JS does:
-            //   var startDate = new Date('05/01/2026');  ← current expiry date
-            // This is embedded in the manage page script for the date-picker.
-            const expiryMatch = manageRes.data.match(
-                /var\s+startDate\s*=\s*new\s+Date\(\s*['"]([^'"]+)['"]\s*\)/
-            );
-
-            if (expiryMatch) {
-                const expiryDate = new Date(expiryMatch[1]);
-                const now = new Date();
-                // Fractional days remaining until expiry (can be negative if expired)
-                const diffDays = (expiryDate - now) / (1000 * 60 * 60 * 24);
-                const daysLeft = Math.ceil(diffDays); // round up, same as Math.ceil in browser JS
-
-                this.log(`📆 服务 ${service.id} 到期日: ${expiryDate.toDateString()}, 剩余约 ${daysLeft} 天`);
-
-                if (diffDays > 1) {
-                    // Still outside the 1-day renewal window — skip POST entirely
-                    this.log(`❌ 续期受限 (服务 ${service.id}): 距到期还有 ${daysLeft} 天，不在续期窗口内`);
-                    this.renewResults.push({
-                        serviceId: service.id,
-                        success: false,
-                        restricted: true,
-                        daysLeft,
-                        expiryDate: expiryDate.toLocaleDateString('en-US')
-                    });
-                    return;
-                }
-                // diffDays <= 1: within the renewal window, proceed
-            } else {
-                // Could not extract expiry date — log a warning but still attempt renewal
-                this.log(`⚠️ 无法从页面提取到期日期，将直接尝试续期...`);
-            }
-            // ── End expiry check ─────────────────────────────────────────────
-
-            this.log(`📅 在续期窗口内，提交续期 (${RENEW_DAYS}天)...`);
+            this.log(`📅 提交续期 (${RENEW_DAYS}天)...`);
             await sleep(1000, 2000);
 
             const params = new URLSearchParams();
@@ -257,13 +219,39 @@ class HidenCloudBot {
 
             const res = await this.request('POST', `/service/${service.id}/renew`, params.toString());
 
+            // [FIX] Check for "Renewal Restricted" BEFORE checking the redirect URL.
+            // HidenCloud returns this error (in JSON or HTML body) with HTTP 200,
+            // so the script previously fell through to checkAndPayInvoices and
+            // falsely reported success.
+            const bodyText = res.data || '';
+
+            if (bodyText.includes('Renewal Restricted')) {
+                // Extract how many days are left, e.g. "Your service expires in 3 days."
+                const daysMatch = bodyText.match(/expires in (\d+) days?/i);
+                const daysLeft = daysMatch ? parseInt(daysMatch[1], 10) : null;
+                const daysMsg = daysLeft !== null
+                    ? `Your service expires in ${daysLeft} days.`
+                    : 'Check the dashboard for the exact expiry date.';
+
+                this.log(`❌ 续期受限 (服务 ${service.id}): Renewal Restricted. ${daysMsg}`);
+                this.renewResults.push({
+                    serviceId: service.id,
+                    success: false,
+                    restricted: true,
+                    daysLeft,
+                    message: `Renewal Restricted\nYou can only renew your free service when there is less than 1 day left before it expires. ${daysMsg}`
+                });
+                return;
+            }
+
             if (res.finalUrl && res.finalUrl.includes('/invoice/')) {
                 this.log(`⚡️ 续期成功，前往支付`);
                 await this.performPayFromHtml(res.data, res.finalUrl);
                 this.renewResults.push({
                     serviceId: service.id,
                     success: true,
-                    renewedDays: RENEW_DAYS
+                    renewedDays: RENEW_DAYS,
+                    message: `Your service expires in ${RENEW_DAYS} days.`
                 });
             } else {
                 this.log('⚠️ 续期后未跳转，检查账单列表...');
@@ -272,7 +260,9 @@ class HidenCloudBot {
                     serviceId: service.id,
                     success: paid,
                     renewedDays: paid ? RENEW_DAYS : null,
-                    message: paid ? null : '续期后未找到应付账单，请手动确认。'
+                    message: paid
+                        ? `Your service expires in ${RENEW_DAYS} days.`
+                        : '续期后未找到应付账单，请手动确认。'
                 });
             }
 
@@ -689,13 +679,13 @@ async function sendTelegramNotification(summaryText) {
                 summaryText += `\n  📌 服务 ID: ${r.serviceId}\n`;
                 if (r.success) {
                     summaryText += `  状态: ✅ 续期成功\n`;
-                    summaryText += `  Your service expires in ${r.renewedDays} days.\n`;
+                    summaryText += `  ${r.message}\n`;
                 } else if (r.restricted) {
                     summaryText += `  状态: ❌ 续期失败\n`;
                     summaryText += `  Renewal Restricted\n`;
                     summaryText += `  You can only renew your free service when there is less than 1 day left before it expires. `;
                     summaryText += r.daysLeft !== null
-                        ? `Your service expires in ${r.daysLeft} days. (到期日: ${r.expiryDate || 'N/A'})\n`
+                        ? `Your service expires in ${r.daysLeft} days.\n`
                         : `Check the dashboard for the exact expiry date.\n`;
                 } else {
                     summaryText += `  状态: ❌ 续期失败\n`;
